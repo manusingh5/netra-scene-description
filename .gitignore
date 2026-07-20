@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual Environment
+netra_env/
+
+# Uploads & Outputs (Runtime data)
+uploads/
+outputs/
+
+# OS/IDE
+.vscode/
+.env
