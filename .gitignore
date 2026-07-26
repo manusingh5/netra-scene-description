@@ -13,3 +13,11 @@ outputs/
 # OS/IDE
 .vscode/
 .env
+
+echo "hf_cache/" >> .gitignore
+echo ".cache/" >> .gitignore
+echo "*.tar" >> .gitignore
+echo "*.wav" >> .gitignore
+echo "*.mp4" >> .gitignore
+echo "*.avi" >> .gitignore
+echo "*.mov" >> .gitignore
