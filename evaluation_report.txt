@@ -1,0 +1,140 @@
+============================================================
+NETRA EVALUATION REPORT
+============================================================
+
+──────────────────────────────────────────────────
+Video: test_video1.mp4
+Scene: City street / downtown road
+
+  Frame @ 0s:
+    YOLO:
+      Ground Truth:   ['person', 'car', 'car', 'bus', 'building', 'tree', 'traffic_light']
+      Detected:       ['car', 'person', 'car', 'car', 'person', 'bus']
+      Frame P/R/F1:   0.67 / 0.57 / 0.62
+    Florence-2:
+      Generated:  A busy city street filled with lots of traffic.
+      Expected:   A busy city street with several cars, a bus, pedestrians, and tall buildings.
+      Similarity: 0.42
+    PaddleOCR:
+      Detected:  ['EWashington st22', 'ONE', 'WAY']
+      Expected:  ['E Washington St', 'ONE WAY']
+      Accuracy:  0.50
+
+  Frame @ 10s:
+    YOLO:
+      Ground Truth:   ['person', 'car', 'taxi', 'bus', 'building', 'tree']
+      Detected:       ['car', 'car', 'bus', 'car', 'car', 'person']
+      Frame P/R/F1:   0.50 / 0.50 / 0.50
+    Florence-2:
+      Generated:  A busy city street filled with lots of traffic.
+      Expected:   A busy downtown street with a bus, several cars, a taxi, and pedestrians.
+      Similarity: 0.36
+    PaddleOCR:
+      Detected:  ['EWashington st', '-27', 'ONE', '151TO UNION STATIO', '3681 TX']
+      Expected:  ['E Washington St', 'ONE WAY', '151 TO UNION STATION']
+      Accuracy:  0.33
+
+  Frame @ 20s:
+    YOLO:
+      Ground Truth:   ['bus', 'car', 'person', 'building', 'tree', 'traffic_light']
+      Detected:       ['bus', 'car', 'car', 'person', 'person']
+      Frame P/R/F1:   0.60 / 0.50 / 0.55
+    Florence-2:
+      Generated:  A city street filled with lots of traffic next to tall buildings.
+      Expected:   A city bus is stopped on a busy downtown street with cars and pedestrians around it.
+      Similarity: 0.27
+    PaddleOCR:
+      Detected:  ['EWashington st', 'ONE', 'WAY', '151TO UNION STATIUN', '337']
+      Expected:  ['E Washington St', 'ONE WAY', '151 TO UNION STATION']
+      Accuracy:  0.33
+
+  Frame @ 30s:
+    YOLO:
+      Ground Truth:   ['bus', 'car', 'person', 'building', 'traffic_light']
+      Detected:       ['bus', 'person', 'car', 'car', 'car']
+      Frame P/R/F1:   0.60 / 0.60 / 0.60
+    Florence-2:
+      Generated:  A city bus driving down a city street next to tall buildings.
+      Expected:   A city bus is at a bus stop on a downtown street with several cars and pedestrians.
+      Similarity: 0.29
+    PaddleOCR:
+      Detected:  ['EWashington st#', 'ONE', '151 TO UNION STATION', '4337', 'KARAMO', 'CW2']
+      Expected:  ['E Washington St', 'ONE WAY', '151 TO UNION STATION']
+      Accuracy:  0.67
+
+  Frame @ 40s:
+    YOLO:
+      Ground Truth:   ['bus', 'person', 'car', 'building', 'tree']
+      Detected:       ['bus', 'person', 'person', 'person', 'person']
+      Frame P/R/F1:   0.40 / 0.40 / 0.40
+    Florence-2:
+      Generated:  A city bus driving down a city street next to tall buildings.
+      Expected:   A large city bus passes close to the camera on a busy downtown street.
+      Similarity: 0.38
+    PaddleOCR:
+      Detected:  ['EWashington st2', 'ONE', 'tansicicao.comm', 'NURSINGHOMENEGLIGENCEPERSONALINJURYCARACCIDE']
+      Expected:  ['E Washington St', 'ONE WAY', 'transitchicago.com']
+      Accuracy:  0.33
+
+──────────────────────────────────────────────────
+Video: test_video2.mp4
+Scene: Airport terminal
+
+  Frame @ 0s:
+    YOLO:
+      Ground Truth:   ['person', 'person', 'person', 'suitcase', 'handbag']
+      Detected:       ['person', 'person', 'person', 'person', 'person', 'person', 'person', 'backpack', 'person']
+      Frame P/R/F1:   0.33 / 0.60 / 0.43
+    Florence-2:
+      Generated:  A group of people walking through an airport terminal.
+      Expected:   People walk through an airport terminal with luggage and luggage carts.
+      Similarity: 0.50
+    PaddleOCR:
+      Detected:  ['41-46:51-5871-78', 'Emergency Exit', 'Gates|']
+      Expected:  ['Emergency Exit', 'Gates', '41-46', '51-58', '71-78']
+      Accuracy:  1.00
+
+  Frame @ 10s:
+    YOLO:
+      Ground Truth:   ['person', 'person', 'suitcase', 'handbag']
+      Detected:       ['person', 'person', 'person', 'person', 'person', 'person']
+      Frame P/R/F1:   0.33 / 0.50 / 0.40
+    Florence-2:
+      Generated:  A group of people walking through an airport terminal.
+      Expected:   People are walking through a busy airport terminal toward the gates.
+      Similarity: 0.55
+    PaddleOCR:
+      Detected:  ['ngutueenln', 'ACSUINPUECALN', '41-46:51-5871-78', 'Emergency Exit', 'Gates']
+      Expected:  ['Emergency Exit', 'Gates', '41-46', '51-58', '71-78']
+      Accuracy:  1.00
+
+============================================================
+FINAL SUMMARY
+============================================================
+
+YOLOv8 Detection:
+  TP=20, FP=22, FN=18
+  Precision: 47.6%
+  Recall:    52.6%
+  F1 Score:  50.0%
+
+Per-Class Breakdown:
+  backpack: P=0.0% R=0.0% F1=0.0%
+  building: P=0.0% R=0.0% F1=0.0%
+  bus: P=100.0% R=100.0% F1=100.0%
+  car: P=41.7% R=83.3% F1=55.6%
+  handbag: P=0.0% R=0.0% F1=0.0%
+  person: P=41.7% R=100.0% F1=58.8%
+  suitcase: P=0.0% R=0.0% F1=0.0%
+  taxi: P=0.0% R=0.0% F1=0.0%
+  traffic_light: P=0.0% R=0.0% F1=0.0%
+  tree: P=0.0% R=0.0% F1=0.0%
+
+Florence-2 Captioning:
+  Avg Similarity: 39.5%
+
+PaddleOCR:
+  Avg Word Accuracy: 59.5%
+
+OVERALL PIPELINE SCORE: 49.7%
+Total Frames Evaluated: 7

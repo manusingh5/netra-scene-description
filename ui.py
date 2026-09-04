@@ -10,6 +10,8 @@ import os
 import time
 from io import BytesIO
 
+from models.stt_model import get_stt_model
+
 BACKEND_URL = "http://127.0.0.1:8000"
 
 def process_video_frontend(video_file):
@@ -135,10 +137,23 @@ def transcribe_and_ask(audio_file, task_id):
     if not audio_file:
         return "❌ Please record your question via microphone."
     
-    mock_transcription = "What objects are visible in the video?"
-    answer = chat_with_bot(mock_transcription, task_id)
-    
-    return f"🎤 You asked: {mock_transcription}\n\n{answer}"
+    # REAL Whisper transcription
+    try:
+        stt = get_stt_model()
+        transcription = stt.transcribe(audio_file)
+        
+        if not transcription:
+            return "❌ Could not transcribe audio. Please try again."
+        
+        # Ask backend with REAL transcription
+        answer = chat_with_bot(transcription, task_id)
+        
+        return f"🎤 You asked: {transcription}\n\n{answer}"
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        return f"❌ Transcription error: {str(e)}\n{error_details}"
 
 # ============================================================
 # GRADIO UI
