@@ -1,371 +1,1642 @@
-# evaluate.py
 """
 NETRA Evaluation Script
-Calculates REAL metrics by comparing pipeline output vs Ground Truth
 
-Run: python evaluate.py
+Metrics:
+1. YOLOv8
+   - Precision
+   - Recall
+   - F1 Score
+
+   NOTE:
+   These metrics use class/count matching.
+   Proper bounding-box mAP is evaluated separately using
+   Ultralytics validation and manually annotated bounding boxes.
+
+2. Florence-2
+   - BLEU
+   - ROUGE-L
+   - BERTScore Precision
+   - BERTScore Recall
+   - BERTScore F1
+
+3. PaddleOCR
+   - Raw CER
+   - Raw WER
+   - Normalized Order-Invariant CER
+   - Normalized Order-Invariant WER
+
+Run:
+    python evaluate.py
 """
 
-import cv2
 import os
 import sys
-import types
-import importlib
-import importlib.machinery
+import re
+import unicodedata
+import cv2
+
 from collections import Counter
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# ------------------------------------------------------------
+# PROJECT ROOT
+# ------------------------------------------------------------
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PROJECT_ROOT)
 
 from ground_truth import GROUND_TRUTH
 
-# ═══════════════════════════════════════════════════════════════
-# FLASH ATTENTION STUB (Fix for ImportError)
-# ═══════════════════════════════════════════════════════════════
-if importlib.util.find_spec("flash_attn") is None:
-    flash_attn_stub = types.ModuleType("flash_attn")
-    flash_attn_stub.__version__ = "2.0"
-    flash_attn_stub.__spec__ = importlib.machinery.ModuleSpec(
-        "flash_attn", loader=None, is_package=True
-    )
-    bert_pad_stub = types.ModuleType("flash_attn.bert_pad")
-    bert_pad_stub.__spec__ = importlib.machinery.ModuleSpec(
-        "flash_attn.bert_pad", loader=None
-    )
-    sys.modules["flash_attn"] = flash_attn_stub
-    sys.modules["flash_attn.bert_pad"] = bert_pad_stub
-    print("  ⚙️ flash_attn stub created (with __spec__)")
+from models.yolo_model import YOLOModel
+from models.ocr_model import OCRModel
+from models.florence_model import FlorenceModel
 
-# Patch transformers flash_attn check
-import transformers.utils.import_utils
-_original_is_package_available = transformers.utils.import_utils._is_package_available
-def _patched_is_package_available(pkg_name):
-    if pkg_name == "flash_attn":
-        return True
-    return _original_is_package_available(pkg_name)
-transformers.utils.import_utils._is_package_available = _patched_is_package_available
-transformers.utils.import_utils.is_flash_attn_2_available = lambda: False
+from nltk.translate.bleu_score import (
+    sentence_bleu,
+    SmoothingFunction
+)
 
-# ═══════════════════════════════════════════════════════════════
+from rouge_score import rouge_scorer
+from jiwer import wer, cer
+from bert_score import score as bert_score
+
+
+# ------------------------------------------------------------
 # CONFIG
-# ═══════════════════════════════════════════════════════════════
-UPLOADS_DIR = "uploads"
-CONFIDENCE_THRESHOLD = 0.5
-REPORT_FILE = "evaluation_report.txt"
+# ------------------------------------------------------------
 
-# ═══════════════════════════════════════════════════════════════
-# METRIC HELPERS
-# ═══════════════════════════════════════════════════════════════
+UPLOADS_DIR = os.path.join(
+    PROJECT_ROOT,
+    "uploads"
+)
+
+REPORT_FILE = os.path.join(
+    PROJECT_ROOT,
+    "evaluation_report.txt"
+)
+
+
+# ------------------------------------------------------------
+# GENERAL HELPERS
+# ------------------------------------------------------------
 
 def calc_precision_recall_f1(tp, fp, fn):
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    precision = (
+        tp / (tp + fp)
+        if (tp + fp) > 0
+        else 0.0
+    )
+
+    recall = (
+        tp / (tp + fn)
+        if (tp + fn) > 0
+        else 0.0
+    )
+
+    if precision + recall > 0:
+
+        f1 = (
+            2
+            * precision
+            * recall
+            / (precision + recall)
+        )
+
+    else:
+
+        f1 = 0.0
+
     return precision, recall, f1
 
-def caption_similarity(generated, expected):
-    """Simple word overlap ratio between generated and expected caption"""
-    gen_words = set(generated.lower().replace('.', '').replace(',', '').split())
-    exp_words = set(expected.lower().replace('.', '').replace(',', '').split())
-    if len(exp_words) == 0:
+
+# ------------------------------------------------------------
+# TEXT NORMALIZATION
+# ------------------------------------------------------------
+
+def normalize_text(text):
+    """
+    Basic normalization used for OCR evaluation.
+
+    - Unicode normalization
+    - lowercase
+    - remove punctuation
+    - keep letters/numbers
+    - collapse whitespace
+    """
+
+    if not text:
+        return ""
+
+    text = unicodedata.normalize(
+        "NFKC",
+        str(text)
+    )
+
+    text = text.lower()
+
+    # Replace punctuation/symbols with spaces.
+    # Keep letters, digits and whitespace.
+    text = re.sub(
+        r"[^\w\s]",
+        " ",
+        text
+    )
+
+    # Underscore is included in \w, remove separately.
+    text = text.replace(
+        "_",
+        " "
+    )
+
+    # Collapse repeated spaces.
+    text = " ".join(
+        text.split()
+    )
+
+    return text
+
+
+def normalize_ocr_regions(texts):
+    """
+    Normalize every OCR text region independently.
+
+    PaddleOCR may return regions in a different order from
+    manually entered ground truth.
+
+    Sorting makes the comparison order-invariant at region level.
+    """
+
+    normalized_regions = []
+
+    for text in texts:
+
+        cleaned = normalize_text(
+            text
+        )
+
+        if cleaned:
+            normalized_regions.append(
+                cleaned
+            )
+
+    normalized_regions.sort()
+
+    return normalized_regions
+
+
+# ------------------------------------------------------------
+# FLORENCE HELPERS
+# ------------------------------------------------------------
+
+def clean_caption(text):
+    """
+    Remove Florence special tokens.
+    """
+
+    if not text:
+        return ""
+
+    text = text.replace(
+        "</s>",
+        ""
+    )
+
+    text = text.replace(
+        "<s>",
+        ""
+    )
+
+    text = text.strip()
+
+    return text
+
+
+def calculate_bleu(
+    generated_caption,
+    reference_caption
+):
+
+    if (
+        not generated_caption
+        or not reference_caption
+    ):
         return 0.0
-    overlap = gen_words & exp_words
-    return len(overlap) / len(exp_words)
 
-def text_accuracy(detected_texts, expected_texts):
-    """Word-level accuracy for OCR"""
-    if len(expected_texts) == 0:
-        return 1.0 if len(detected_texts) == 0 else 0.0
-    correct = 0
-    for exp in expected_texts:
-        for det in detected_texts:
-            if exp.lower() in det.lower() or det.lower() in exp.lower():
-                correct += 1
-                break
-    return correct / len(expected_texts)
+    generated_tokens = (
+        generated_caption
+        .lower()
+        .split()
+    )
 
-# ═══════════════════════════════════════════════════════════════
+    reference_tokens = (
+        reference_caption
+        .lower()
+        .split()
+    )
+
+    smoothing = (
+        SmoothingFunction()
+        .method1
+    )
+
+    score = sentence_bleu(
+        [reference_tokens],
+        generated_tokens,
+        smoothing_function=smoothing
+    )
+
+    return score
+
+
+def calculate_rouge_l(
+    generated_caption,
+    reference_caption
+):
+
+    if (
+        not generated_caption
+        or not reference_caption
+    ):
+        return 0.0
+
+    scorer = rouge_scorer.RougeScorer(
+        ["rougeL"],
+        use_stemmer=True
+    )
+
+    result = scorer.score(
+        reference_caption,
+        generated_caption
+    )
+
+    return result[
+        "rougeL"
+    ].fmeasure
+
+
+# ------------------------------------------------------------
+# OCR METRICS
+# ------------------------------------------------------------
+
+def calculate_ocr_metrics(
+    detected_texts,
+    expected_texts
+):
+    """
+    Returns:
+
+    raw_cer
+    raw_wer
+    normalized_cer
+    normalized_wer
+
+    RAW:
+        Directly joins OCR regions.
+
+    NORMALIZED:
+        Normalizes each region and sorts regions before joining.
+
+    The normalized version is useful for scene-text OCR because
+    OCR detection order is not always the same as manual
+    ground-truth order.
+    """
+
+    # --------------------------------------------------------
+    # RAW TEXT
+    # --------------------------------------------------------
+
+    raw_detected = " ".join(
+        str(x)
+        for x in detected_texts
+    )
+
+    raw_expected = " ".join(
+        str(x)
+        for x in expected_texts
+    )
+
+    raw_detected = (
+        raw_detected
+        .lower()
+        .strip()
+    )
+
+    raw_expected = (
+        raw_expected
+        .lower()
+        .strip()
+    )
+
+    # --------------------------------------------------------
+    # RAW CER / WER
+    # --------------------------------------------------------
+
+    if not raw_expected:
+
+        if not raw_detected:
+
+            raw_cer = 0.0
+            raw_wer = 0.0
+
+        else:
+
+            raw_cer = 1.0
+            raw_wer = 1.0
+
+    else:
+
+        try:
+
+            raw_cer = cer(
+                raw_expected,
+                raw_detected
+            )
+
+        except Exception:
+
+            raw_cer = 1.0
+
+        try:
+
+            raw_wer = wer(
+                raw_expected,
+                raw_detected
+            )
+
+        except Exception:
+
+            raw_wer = 1.0
+
+
+    # --------------------------------------------------------
+    # NORMALIZED REGIONS
+    # --------------------------------------------------------
+
+    detected_regions = (
+        normalize_ocr_regions(
+            detected_texts
+        )
+    )
+
+    expected_regions = (
+        normalize_ocr_regions(
+            expected_texts
+        )
+    )
+
+    normalized_detected = " ".join(
+        detected_regions
+    )
+
+    normalized_expected = " ".join(
+        expected_regions
+    )
+
+    # --------------------------------------------------------
+    # NORMALIZED CER / WER
+    # --------------------------------------------------------
+
+    if not normalized_expected:
+
+        if not normalized_detected:
+
+            normalized_cer = 0.0
+            normalized_wer = 0.0
+
+        else:
+
+            normalized_cer = 1.0
+            normalized_wer = 1.0
+
+    else:
+
+        try:
+
+            normalized_cer = cer(
+                normalized_expected,
+                normalized_detected
+            )
+
+        except Exception:
+
+            normalized_cer = 1.0
+
+        try:
+
+            normalized_wer = wer(
+                normalized_expected,
+                normalized_detected
+            )
+
+        except Exception:
+
+            normalized_wer = 1.0
+
+
+    return {
+        "raw_cer": raw_cer,
+        "raw_wer": raw_wer,
+        "normalized_cer": normalized_cer,
+        "normalized_wer": normalized_wer,
+        "raw_expected": raw_expected,
+        "raw_detected": raw_detected,
+        "normalized_expected": normalized_expected,
+        "normalized_detected": normalized_detected
+    }
+
+
+# ------------------------------------------------------------
 # FRAME EXTRACTION
-# ═══════════════════════════════════════════════════════════════
+# ------------------------------------------------------------
 
-def extract_frame_at_timestamp(video_path, timestamp_sec):
-    """Extract a single frame at given timestamp"""
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_number = int(timestamp_sec * fps)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-    ret, frame = cap.read()
+def extract_frame_at_timestamp(
+    video_path,
+    timestamp_sec
+):
+
+    cap = cv2.VideoCapture(
+        video_path
+    )
+
+    if not cap.isOpened():
+
+        cap.release()
+        return None
+
+    cap.set(
+        cv2.CAP_PROP_POS_MSEC,
+        timestamp_sec * 1000
+    )
+
+    success, frame = cap.read()
+
     cap.release()
-    if ret:
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    if success:
+        return frame
+
     return None
 
-# ═══════════════════════════════════════════════════════════════
-# MAIN EVALUATION
-# ═══════════════════════════════════════════════════════════════
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
 
 def main():
-    print("=" * 60)
-    print("NETRA EVALUATION — Starting...")
-    print("=" * 60)
 
-    # ── Load Models ──
-    print("\n[1/4] Loading models...")
-
-    # YOLO
-    from ultralytics import YOLO
-    yolo_model = YOLO("yolov8n.pt")
-    print("  ✅ YOLOv8-nano loaded")
-
-    # Florence-2 — Direct loading with flash_attn stub
-    import torch
-    import PIL.Image as Image
-    from transformers import AutoProcessor, AutoModelForCausalLM
-
-    florence_processor = AutoProcessor.from_pretrained(
-        "microsoft/Florence-2-base",
-        trust_remote_code=True
+    print(
+        "=" * 70
     )
-    florence_model = AutoModelForCausalLM.from_pretrained(
-        "microsoft/Florence-2-base",
-        trust_remote_code=True,
-        torch_dtype=torch.float32
+
+    print(
+        "NETRA MODEL EVALUATION"
     )
-    florence_model.eval()
-    print("  ✅ Florence-2 loaded")
 
-    # PaddleOCR
-    from paddleocr import PaddleOCR
-    ocr_engine = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-    print("  ✅ PaddleOCR loaded")
+    print(
+        "=" * 70
+    )
 
-    print("\n[2/4] All models loaded. Starting evaluation...\n")
+    print(
+        "\n[1/3] Loading NETRA models...\n"
+    )
 
-    # ── Evaluation Variables ──
-    yolo_tp, yolo_fp, yolo_fn = 0, 0, 0
+
+    # --------------------------------------------------------
+    # LOAD MODELS
+    # --------------------------------------------------------
+
+    yolo_model = YOLOModel()
+
+    ocr_model = OCRModel()
+
+    florence_model = FlorenceModel()
+
+    print(
+        "\nModels loaded.\n"
+    )
+
+
+    # --------------------------------------------------------
+    # YOLO STORAGE
+    # --------------------------------------------------------
+
+    yolo_tp = 0
+    yolo_fp = 0
+    yolo_fn = 0
+
     per_class_stats = {}
-    caption_scores = []
-    ocr_scores = []
+
+
+    # --------------------------------------------------------
+    # FLORENCE STORAGE
+    # --------------------------------------------------------
+
+    bleu_scores = []
+
+    rouge_scores = []
+
+    generated_captions = []
+
+    reference_captions = []
+
+
+    # --------------------------------------------------------
+    # OCR STORAGE
+    # --------------------------------------------------------
+
+    raw_cer_scores = []
+
+    raw_wer_scores = []
+
+    normalized_cer_scores = []
+
+    normalized_wer_scores = []
+
+
+    # --------------------------------------------------------
+    # DATASET COUNTERS
+    # --------------------------------------------------------
+
     total_frames = 0
 
+    evaluated_frames = 0
+
+
+    # --------------------------------------------------------
+    # REPORT
+    # --------------------------------------------------------
+
     report_lines = []
-    report_lines.append("=" * 60)
-    report_lines.append("NETRA EVALUATION REPORT")
-    report_lines.append("=" * 60)
 
-    # ── Process Each Video ──
-    for video_name, video_data in GROUND_TRUTH.items():
-        video_path = os.path.join(UPLOADS_DIR, video_name)
+    report_lines.append(
+        "=" * 70
+    )
 
-        if not os.path.exists(video_path):
-            print(f"  ⚠️ Video not found: {video_name}")
+    report_lines.append(
+        "NETRA EVALUATION REPORT"
+    )
+
+    report_lines.append(
+        "=" * 70
+    )
+
+
+    # ========================================================
+    # PROCESS VIDEOS
+    # ========================================================
+
+    for (
+        video_name,
+        video_data
+    ) in GROUND_TRUTH.items():
+
+
+        video_path = os.path.join(
+            UPLOADS_DIR,
+            video_name
+        )
+
+
+        print(
+            "\n" + "-" * 70
+        )
+
+        print(
+            f"VIDEO: {video_name}"
+        )
+
+        print(
+            "-" * 70
+        )
+
+
+        report_lines.append(
+            ""
+        )
+
+        report_lines.append(
+            "-" * 70
+        )
+
+        report_lines.append(
+            f"VIDEO: {video_name}"
+        )
+
+        report_lines.append(
+            "Scene: "
+            + video_data.get(
+                "scene_type",
+                "Unknown"
+            )
+        )
+
+
+        if not os.path.exists(
+            video_path
+        ):
+
+            print(
+                f"WARNING: Video not found: "
+                f"{video_path}"
+            )
+
             continue
 
-        print(f"\n{'─' * 50}")
-        print(f"Video: {video_name}")
-        print(f"   Scene: {video_data['scene_type']}")
-        report_lines.append(f"\n{'─' * 50}")
-        report_lines.append(f"Video: {video_name}")
-        report_lines.append(f"Scene: {video_data['scene_type']}")
 
-        frames = video_data["frames"]
+        # ====================================================
+        # PROCESS ANNOTATED FRAMES
+        # ====================================================
 
-        for timestamp, gt_data in frames.items():
+        for (
+            timestamp,
+            gt_data
+        ) in video_data[
+            "frames"
+        ].items():
+
+
             total_frames += 1
-            print(f"\n  Timestamp: {timestamp}s")
 
-            # Extract frame
-            frame = extract_frame_at_timestamp(video_path, timestamp)
+
+            print(
+                f"\nTimestamp: {timestamp}s"
+            )
+
+
+            frame = (
+                extract_frame_at_timestamp(
+                    video_path,
+                    timestamp
+                )
+            )
+
+
             if frame is None:
-                print(f"     ⚠️ Could not extract frame at {timestamp}s")
+
+                print(
+                    "Could not extract frame."
+                )
+
                 continue
 
-            # ─── YOLO EVALUATION ───
-            yolo_results = yolo_model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
-            detected_objects = []
 
-            for result in yolo_results:
-                boxes = result.boxes
-                for box in boxes:
-                    cls_id = int(box.cls[0])
-                    cls_name = yolo_model.names[cls_id]
-                    conf = float(box.conf[0])
-                    detected_objects.append({"class": cls_name, "confidence": conf})
+            evaluated_frames += 1
 
-            # Compare with GT
-            gt_objects = gt_data["objects"]
-            det_counts = Counter([d["class"] for d in detected_objects])
-            gt_counts = Counter(gt_objects)
 
-            all_classes_in_frame = set(list(det_counts.keys()) + list(gt_counts.keys()))
+            # ==================================================
+            # YOLO
+            # ==================================================
 
-            frame_tp, frame_fp, frame_fn = 0, 0, 0
+            detections = (
+                yolo_model.detect(
+                    frame
+                )
+            )
 
-            for cls in all_classes_in_frame:
-                det = det_counts.get(cls, 0)
-                gt = gt_counts.get(cls, 0)
 
-                tp = min(det, gt)
-                fp = max(0, det - gt)
-                fn = max(0, gt - det)
+            detected_objects = [
+
+                detection["name"]
+
+                for detection
+                in detections
+            ]
+
+
+            gt_objects = (
+                gt_data[
+                    "objects"
+                ]
+            )
+
+
+            detected_counts = Counter(
+                detected_objects
+            )
+
+
+            ground_truth_counts = Counter(
+                gt_objects
+            )
+
+
+            all_classes = set(
+                detected_counts.keys()
+            ).union(
+                ground_truth_counts.keys()
+            )
+
+
+            frame_tp = 0
+            frame_fp = 0
+            frame_fn = 0
+
+
+            for class_name in all_classes:
+
+
+                detected_count = (
+                    detected_counts.get(
+                        class_name,
+                        0
+                    )
+                )
+
+
+                ground_truth_count = (
+                    ground_truth_counts.get(
+                        class_name,
+                        0
+                    )
+                )
+
+
+                tp = min(
+                    detected_count,
+                    ground_truth_count
+                )
+
+
+                fp = max(
+                    0,
+                    detected_count
+                    - ground_truth_count
+                )
+
+
+                fn = max(
+                    0,
+                    ground_truth_count
+                    - detected_count
+                )
+
 
                 frame_tp += tp
                 frame_fp += fp
                 frame_fn += fn
 
-                if cls not in per_class_stats:
-                    per_class_stats[cls] = {"tp": 0, "fp": 0, "fn": 0}
-                per_class_stats[cls]["tp"] += tp
-                per_class_stats[cls]["fp"] += fp
-                per_class_stats[cls]["fn"] += fn
+
+                if (
+                    class_name
+                    not in per_class_stats
+                ):
+
+                    per_class_stats[
+                        class_name
+                    ] = {
+                        "tp": 0,
+                        "fp": 0,
+                        "fn": 0
+                    }
+
+
+                per_class_stats[
+                    class_name
+                ]["tp"] += tp
+
+
+                per_class_stats[
+                    class_name
+                ]["fp"] += fp
+
+
+                per_class_stats[
+                    class_name
+                ]["fn"] += fn
+
 
             yolo_tp += frame_tp
             yolo_fp += frame_fp
             yolo_fn += frame_fn
 
-            yolo_prec, yolo_rec, yolo_f1 = calc_precision_recall_f1(frame_tp, frame_fp, frame_fn)
 
-            print(f"     YOLO -> GT: {gt_objects}")
-            print(f"     YOLO -> Detected: {[d['class'] for d in detected_objects]}")
-            print(f"     YOLO -> Frame P/R/F1: {yolo_prec:.2f}/{yolo_rec:.2f}/{yolo_f1:.2f}")
+            (
+                frame_precision,
+                frame_recall,
+                frame_f1
+            ) = calc_precision_recall_f1(
 
-            # ─── FLORENCE-2 EVALUATION ───
-            pil_image = Image.fromarray(frame)
-
-            inputs = florence_processor(
-                text="<CAPTION>", images=pil_image, return_tensors="pt"
+                frame_tp,
+                frame_fp,
+                frame_fn
             )
-            with torch.no_grad():
-                generated = florence_model.generate(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    max_new_tokens=1024,
-                    num_beams=3
+
+
+            print(
+                "\nYOLOv8"
+            )
+
+            print(
+                f"Ground Truth : "
+                f"{gt_objects}"
+            )
+
+            print(
+                f"Detected     : "
+                f"{detected_objects}"
+            )
+
+            print(
+                f"Precision    : "
+                f"{frame_precision:.3f}"
+            )
+
+            print(
+                f"Recall       : "
+                f"{frame_recall:.3f}"
+            )
+
+            print(
+                f"F1           : "
+                f"{frame_f1:.3f}"
+            )
+
+
+            # ==================================================
+            # FLORENCE-2
+            # ==================================================
+
+            raw_caption = (
+                florence_model.caption(
+                    frame
                 )
-            generated_text = florence_processor.batch_decode(generated, skip_special_tokens=True)[0]
+            )
 
-            gt_caption = gt_data["expected_caption"]
-            cap_score = caption_similarity(generated_text, gt_caption)
-            caption_scores.append(cap_score)
 
-            print(f"     Florence-2 -> Generated: {generated_text}")
-            print(f"     Florence-2 -> Expected:  {gt_caption}")
-            print(f"     Florence-2 -> Similarity: {cap_score:.2f}")
+            generated_caption = (
+                clean_caption(
+                    raw_caption
+                )
+            )
 
-            # ─── PADDLEOCR EVALUATION ───
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            try:
-                ocr_result = ocr_engine.ocr(frame_bgr, cls=True)
-            except Exception as e:
-                print(f"     OCR error: {e}")
-                ocr_result = None
 
-            detected_texts = []
-            if ocr_result and ocr_result[0]:
-                for line in ocr_result[0]:
-                    if line and len(line) >= 2:
-                        text = line[1][0]
-                        detected_texts.append(text)
+            reference_caption = (
+                gt_data[
+                    "expected_caption"
+                ]
+            )
 
-            gt_texts = gt_data["expected_text"]
-            ocr_acc = text_accuracy(detected_texts, gt_texts)
-            ocr_scores.append(ocr_acc)
 
-            print(f"     PaddleOCR -> Detected: {detected_texts}")
-            print(f"     PaddleOCR -> Expected: {gt_texts}")
-            print(f"     PaddleOCR -> Accuracy: {ocr_acc:.2f}")
+            bleu_score = (
+                calculate_bleu(
+                    generated_caption,
+                    reference_caption
+                )
+            )
 
-            # ─── Write to report ───
-            report_lines.append(f"\n  Frame @ {timestamp}s:")
-            report_lines.append(f"    YOLO:")
-            report_lines.append(f"      Ground Truth:   {gt_objects}")
-            report_lines.append(f"      Detected:       {[d['class'] for d in detected_objects]}")
-            report_lines.append(f"      Frame P/R/F1:   {yolo_prec:.2f} / {yolo_rec:.2f} / {yolo_f1:.2f}")
-            report_lines.append(f"    Florence-2:")
-            report_lines.append(f"      Generated:  {generated_text}")
-            report_lines.append(f"      Expected:   {gt_caption}")
-            report_lines.append(f"      Similarity: {cap_score:.2f}")
-            report_lines.append(f"    PaddleOCR:")
-            report_lines.append(f"      Detected:  {detected_texts}")
-            report_lines.append(f"      Expected:  {gt_texts}")
-            report_lines.append(f"      Accuracy:  {ocr_acc:.2f}")
 
-    # ── FINAL METRICS CALCULATION ──
-    print(f"\n{'=' * 60}")
-    print("FINAL RESULTS")
-    print(f"{'=' * 60}")
+            rouge_l_score = (
+                calculate_rouge_l(
+                    generated_caption,
+                    reference_caption
+                )
+            )
 
-    # YOLO Overall
-    yolo_precision, yolo_recall, yolo_f1 = calc_precision_recall_f1(yolo_tp, yolo_fp, yolo_fn)
-    print(f"\nYOLOv8 Detection (Overall):")
-    print(f"   True Positives:  {yolo_tp}")
-    print(f"   False Positives: {yolo_fp}")
-    print(f"   False Negatives: {yolo_fn}")
-    print(f"   Precision: {yolo_precision*100:.1f}%")
-    print(f"   Recall:    {yolo_recall*100:.1f}%")
-    print(f"   F1 Score:  {yolo_f1*100:.1f}%")
 
-    # Per-class YOLO
-    print(f"\nPer-Class Breakdown:")
-    for cls, stats in sorted(per_class_stats.items()):
-        p, r, f1 = calc_precision_recall_f1(stats["tp"], stats["fp"], stats["fn"])
-        print(f"   {cls:20s}: P={p*100:.1f}% R={r*100:.1f}% F1={f1*100:.1f}% (TP={stats['tp']} FP={stats['fp']} FN={stats['fn']})")
+            bleu_scores.append(
+                bleu_score
+            )
 
-    # Florence-2
-    avg_caption_score = sum(caption_scores) / len(caption_scores) if caption_scores else 0
-    print(f"\nFlorence-2 Captioning:")
-    print(f"   Avg Similarity Score: {avg_caption_score*100:.1f}%")
-    print(f"   Frames Evaluated:     {len(caption_scores)}")
-    print(f"   Scores: {[f'{s:.2f}' for s in caption_scores]}")
 
-    # PaddleOCR
-    avg_ocr_score = sum(ocr_scores) / len(ocr_scores) if ocr_scores else 0
-    print(f"\nPaddleOCR:")
-    print(f"   Avg Word Accuracy: {avg_ocr_score*100:.1f}%")
-    print(f"   Frames Evaluated:  {len(ocr_scores)}")
-    print(f"   Scores: {[f'{s:.2f}' for s in ocr_scores]}")
+            rouge_scores.append(
+                rouge_l_score
+            )
 
-    # Overall
-    overall = (yolo_f1 + avg_caption_score + avg_ocr_score) / 3
-    print(f"\n{'=' * 60}")
-    print(f"OVERALL PIPELINE SCORE: {overall*100:.1f}%")
-    print(f"{'=' * 60}")
-    print(f"   YOLO F1:           {yolo_f1*100:.1f}%")
-    print(f"   Florence-2 Score:  {avg_caption_score*100:.1f}%")
-    print(f"   PaddleOCR Score:   {avg_ocr_score*100:.1f}%")
-    print(f"   Total Frames:      {total_frames}")
-    print(f"{'=' * 60}")
 
-    # ── Write report file ──
-    report_lines.append(f"\n{'=' * 60}")
-    report_lines.append("FINAL SUMMARY")
-    report_lines.append(f"{'=' * 60}")
-    report_lines.append(f"")
-    report_lines.append(f"YOLOv8 Detection:")
-    report_lines.append(f"  TP={yolo_tp}, FP={yolo_fp}, FN={yolo_fn}")
-    report_lines.append(f"  Precision: {yolo_precision*100:.1f}%")
-    report_lines.append(f"  Recall:    {yolo_recall*100:.1f}%")
-    report_lines.append(f"  F1 Score:  {yolo_f1*100:.1f}%")
-    report_lines.append(f"")
-    report_lines.append(f"Per-Class Breakdown:")
-    for cls, stats in sorted(per_class_stats.items()):
-        p, r, f1 = calc_precision_recall_f1(stats["tp"], stats["fp"], stats["fn"])
-        report_lines.append(f"  {cls}: P={p*100:.1f}% R={r*100:.1f}% F1={f1*100:.1f}%")
-    report_lines.append(f"")
-    report_lines.append(f"Florence-2 Captioning:")
-    report_lines.append(f"  Avg Similarity: {avg_caption_score*100:.1f}%")
-    report_lines.append(f"")
-    report_lines.append(f"PaddleOCR:")
-    report_lines.append(f"  Avg Word Accuracy: {avg_ocr_score*100:.1f}%")
-    report_lines.append(f"")
-    report_lines.append(f"OVERALL PIPELINE SCORE: {overall*100:.1f}%")
-    report_lines.append(f"Total Frames Evaluated: {total_frames}")
+            generated_captions.append(
+                generated_caption
+            )
 
-    with open(REPORT_FILE, "w", encoding="utf-8") as f:
-        f.write("\n".join(report_lines))
 
-    print(f"\nReport saved to: {REPORT_FILE}")
-    print(f"\nEvaluation Complete!")
+            reference_captions.append(
+                reference_caption
+            )
+
+
+            print(
+                "\nFlorence-2"
+            )
+
+
+            print(
+                f"Expected : "
+                f"{reference_caption}"
+            )
+
+
+            print(
+                f"Generated: "
+                f"{generated_caption}"
+            )
+
+
+            print(
+                f"BLEU     : "
+                f"{bleu_score:.3f}"
+            )
+
+
+            print(
+                f"ROUGE-L  : "
+                f"{rouge_l_score:.3f}"
+            )
+
+
+            # ==================================================
+            # PADDLE OCR
+            # ==================================================
+
+            detected_texts = (
+                ocr_model.extract_text(
+                    frame
+                )
+            )
+
+
+            expected_texts = (
+                gt_data[
+                    "expected_text"
+                ]
+            )
+
+
+            ocr_result = (
+                calculate_ocr_metrics(
+                    detected_texts,
+                    expected_texts
+                )
+            )
+
+
+            raw_cer_scores.append(
+                ocr_result[
+                    "raw_cer"
+                ]
+            )
+
+
+            raw_wer_scores.append(
+                ocr_result[
+                    "raw_wer"
+                ]
+            )
+
+
+            normalized_cer_scores.append(
+                ocr_result[
+                    "normalized_cer"
+                ]
+            )
+
+
+            normalized_wer_scores.append(
+                ocr_result[
+                    "normalized_wer"
+                ]
+            )
+
+
+            print(
+                "\nPaddleOCR"
+            )
+
+
+            print(
+                f"Expected Regions : "
+                f"{expected_texts}"
+            )
+
+
+            print(
+                f"Detected Regions : "
+                f"{detected_texts}"
+            )
+
+
+            print(
+                "\nRaw Comparison"
+            )
+
+
+            print(
+                f"Expected : "
+                f"{ocr_result['raw_expected']}"
+            )
+
+
+            print(
+                f"Detected : "
+                f"{ocr_result['raw_detected']}"
+            )
+
+
+            print(
+                f"Raw CER  : "
+                f"{ocr_result['raw_cer']:.3f}"
+            )
+
+
+            print(
+                f"Raw WER  : "
+                f"{ocr_result['raw_wer']:.3f}"
+            )
+
+
+            print(
+                "\nNormalized "
+                "Order-Invariant Comparison"
+            )
+
+
+            print(
+                f"Expected : "
+                f"{ocr_result['normalized_expected']}"
+            )
+
+
+            print(
+                f"Detected : "
+                f"{ocr_result['normalized_detected']}"
+            )
+
+
+            print(
+                f"CER      : "
+                f"{ocr_result['normalized_cer']:.3f}"
+            )
+
+
+            print(
+                f"WER      : "
+                f"{ocr_result['normalized_wer']:.3f}"
+            )
+
+
+    # ========================================================
+    # FINAL YOLO METRICS
+    # ========================================================
+
+    (
+        yolo_precision,
+        yolo_recall,
+        yolo_f1
+    ) = calc_precision_recall_f1(
+
+        yolo_tp,
+        yolo_fp,
+        yolo_fn
+    )
+
+
+    # ========================================================
+    # FINAL FLORENCE METRICS
+    # ========================================================
+
+    average_bleu = (
+
+        sum(
+            bleu_scores
+        )
+        / len(
+            bleu_scores
+        )
+
+        if bleu_scores
+
+        else 0.0
+    )
+
+
+    average_rouge_l = (
+
+        sum(
+            rouge_scores
+        )
+        / len(
+            rouge_scores
+        )
+
+        if rouge_scores
+
+        else 0.0
+    )
+
+
+    # --------------------------------------------------------
+    # BERTSCORE
+    # --------------------------------------------------------
+
+    average_bert_precision = 0.0
+
+    average_bert_recall = 0.0
+
+    average_bert_f1 = 0.0
+
+
+    if generated_captions:
+
+        print(
+            "\nCalculating BERTScore..."
+        )
+
+
+        P, R, F1 = bert_score(
+
+            generated_captions,
+
+            reference_captions,
+
+            lang="en",
+
+            verbose=True
+        )
+
+
+        average_bert_precision = (
+            P.mean().item()
+        )
+
+
+        average_bert_recall = (
+            R.mean().item()
+        )
+
+
+        average_bert_f1 = (
+            F1.mean().item()
+        )
+
+
+    # ========================================================
+    # FINAL OCR METRICS
+    # ========================================================
+
+    average_raw_cer = (
+
+        sum(
+            raw_cer_scores
+        )
+        / len(
+            raw_cer_scores
+        )
+
+        if raw_cer_scores
+
+        else 0.0
+    )
+
+
+    average_raw_wer = (
+
+        sum(
+            raw_wer_scores
+        )
+        / len(
+            raw_wer_scores
+        )
+
+        if raw_wer_scores
+
+        else 0.0
+    )
+
+
+    average_normalized_cer = (
+
+        sum(
+            normalized_cer_scores
+        )
+        / len(
+            normalized_cer_scores
+        )
+
+        if normalized_cer_scores
+
+        else 0.0
+    )
+
+
+    average_normalized_wer = (
+
+        sum(
+            normalized_wer_scores
+        )
+        / len(
+            normalized_wer_scores
+        )
+
+        if normalized_wer_scores
+
+        else 0.0
+    )
+
+
+    # ========================================================
+    # PRINT FINAL RESULTS
+    # ========================================================
+
+    print(
+        "\n"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "FINAL NETRA EVALUATION RESULTS"
+    )
+
+    print(
+        "=" * 70
+    )
+
+
+    # --------------------------------------------------------
+    # YOLO
+    # --------------------------------------------------------
+
+    print(
+        "\nYOLOv8 Object Detection"
+    )
+
+    print(
+        "-" * 40
+    )
+
+
+    print(
+        f"Precision : "
+        f"{yolo_precision:.3f} "
+        f"({yolo_precision * 100:.1f}%)"
+    )
+
+
+    print(
+        f"Recall    : "
+        f"{yolo_recall:.3f} "
+        f"({yolo_recall * 100:.1f}%)"
+    )
+
+
+    print(
+        f"F1 Score  : "
+        f"{yolo_f1:.3f} "
+        f"({yolo_f1 * 100:.1f}%)"
+    )
+
+
+    print(
+        "\nNOTE:"
+    )
+
+    print(
+        "The YOLO values above use "
+        "class-count matching."
+    )
+
+    print(
+        "Use the separate Ultralytics "
+        "bounding-box validation result "
+        "for mAP."
+    )
+
+
+    # --------------------------------------------------------
+    # FLORENCE
+    # --------------------------------------------------------
+
+    print(
+        "\nFlorence-2 Scene Captioning"
+    )
+
+    print(
+        "-" * 40
+    )
+
+
+    print(
+        f"BLEU               : "
+        f"{average_bleu:.3f}"
+    )
+
+
+    print(
+        f"ROUGE-L            : "
+        f"{average_rouge_l:.3f}"
+    )
+
+
+    print(
+        f"BERTScore Precision: "
+        f"{average_bert_precision:.3f}"
+    )
+
+
+    print(
+        f"BERTScore Recall   : "
+        f"{average_bert_recall:.3f}"
+    )
+
+
+    print(
+        f"BERTScore F1       : "
+        f"{average_bert_f1:.3f}"
+    )
+
+
+    # --------------------------------------------------------
+    # OCR
+    # --------------------------------------------------------
+
+    print(
+        "\nPaddleOCR"
+    )
+
+    print(
+        "-" * 40
+    )
+
+
+    print(
+        "Raw OCR Metrics"
+    )
+
+
+    print(
+        f"Raw CER : "
+        f"{average_raw_cer:.3f}"
+    )
+
+
+    print(
+        f"Raw WER : "
+        f"{average_raw_wer:.3f}"
+    )
+
+
+    print(
+        "\nNormalized Order-Invariant OCR Metrics"
+    )
+
+
+    print(
+        f"Normalized CER : "
+        f"{average_normalized_cer:.3f}"
+    )
+
+
+    print(
+        f"Normalized WER : "
+        f"{average_normalized_wer:.3f}"
+    )
+
+
+    print(
+        "\nNOTE: Lower CER/WER values are better."
+    )
+
+
+    # --------------------------------------------------------
+    # DATASET
+    # --------------------------------------------------------
+
+    print(
+        "\nDataset"
+    )
+
+    print(
+        "-" * 40
+    )
+
+
+    print(
+        f"Annotated Frames: "
+        f"{total_frames}"
+    )
+
+
+    print(
+        f"Evaluated Frames: "
+        f"{evaluated_frames}"
+    )
+
+
+    # ========================================================
+    # WRITE REPORT
+    # ========================================================
+
+    report_lines.append(
+        ""
+    )
+
+    report_lines.append(
+        "=" * 70
+    )
+
+    report_lines.append(
+        "FINAL NETRA EVALUATION RESULTS"
+    )
+
+    report_lines.append(
+        "=" * 70
+    )
+
+
+    report_lines.append(
+        ""
+    )
+
+    report_lines.append(
+        "YOLOv8 Object Detection"
+    )
+
+
+    report_lines.append(
+        f"Precision: "
+        f"{yolo_precision:.3f}"
+    )
+
+
+    report_lines.append(
+        f"Recall: "
+        f"{yolo_recall:.3f}"
+    )
+
+
+    report_lines.append(
+        f"F1 Score: "
+        f"{yolo_f1:.3f}"
+    )
+
+
+    report_lines.append(
+        "NOTE: YOLO values above use "
+        "class-count matching."
+    )
+
+
+    report_lines.append(
+        "Use separate bounding-box "
+        "validation output for mAP."
+    )
+
+
+    # --------------------------------------------------------
+    # FLORENCE REPORT
+    # --------------------------------------------------------
+
+    report_lines.append(
+        ""
+    )
+
+    report_lines.append(
+        "Florence-2 Scene Captioning"
+    )
+
+
+    report_lines.append(
+        f"BLEU: "
+        f"{average_bleu:.3f}"
+    )
+
+
+    report_lines.append(
+        f"ROUGE-L: "
+        f"{average_rouge_l:.3f}"
+    )
+
+
+    report_lines.append(
+        f"BERTScore Precision: "
+        f"{average_bert_precision:.3f}"
+    )
+
+
+    report_lines.append(
+        f"BERTScore Recall: "
+        f"{average_bert_recall:.3f}"
+    )
+
+
+    report_lines.append(
+        f"BERTScore F1: "
+        f"{average_bert_f1:.3f}"
+    )
+
+
+    # --------------------------------------------------------
+    # OCR REPORT
+    # --------------------------------------------------------
+
+    report_lines.append(
+        ""
+    )
+
+    report_lines.append(
+        "PaddleOCR"
+    )
+
+
+    report_lines.append(
+        f"Raw CER: "
+        f"{average_raw_cer:.3f}"
+    )
+
+
+    report_lines.append(
+        f"Raw WER: "
+        f"{average_raw_wer:.3f}"
+    )
+
+
+    report_lines.append(
+        f"Normalized CER: "
+        f"{average_normalized_cer:.3f}"
+    )
+
+
+    report_lines.append(
+        f"Normalized WER: "
+        f"{average_normalized_wer:.3f}"
+    )
+
+
+    report_lines.append(
+        "Lower CER/WER is better."
+    )
+
+
+    # --------------------------------------------------------
+    # DATASET REPORT
+    # --------------------------------------------------------
+
+    report_lines.append(
+        ""
+    )
+
+
+    report_lines.append(
+        f"Annotated Frames: "
+        f"{total_frames}"
+    )
+
+
+    report_lines.append(
+        f"Evaluated Frames: "
+        f"{evaluated_frames}"
+    )
+
+
+    with open(
+        REPORT_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        file.write(
+            "\n".join(
+                report_lines
+            )
+        )
+
+
+    print(
+        f"\nEvaluation report saved to:\n"
+        f"{REPORT_FILE}"
+    )
+
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    try:
+        yolo_model.unload()
+    except Exception:
+        pass
+
+
+    try:
+        ocr_model.unload()
+    except Exception:
+        pass
+
+
+    try:
+        florence_model.unload()
+    except Exception:
+        pass
+
+
+    print(
+        "\nEvaluation complete."
+    )
+
+
+# ------------------------------------------------------------
+# ENTRY POINT
+# ------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
